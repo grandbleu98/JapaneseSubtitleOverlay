@@ -128,37 +128,62 @@ class CaptureService : Service() {
             image.width + rowPadding / pixelStride, image.height,
             android.graphics.Bitmap.Config.ARGB_8888
         )
-        var cropped: android.graphics.Bitmap? = null
+        var fullBitmap: android.graphics.Bitmap? = null
+        var subtitleBitmap: android.graphics.Bitmap? = null
         try {
             padded.copyPixelsFromBuffer(buffer)
-            cropped = android.graphics.Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
-            val input = InputImage.fromBitmap(cropped, 0)
+            fullBitmap = android.graphics.Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
 
-            val korean = try { Tasks.await(koreanRecognizer.process(input)) } catch (_: Exception) { null }
-            val latin = try { Tasks.await(latinRecognizer.process(input)) } catch (_: Exception) { null }
+            // Only inspect the lower part of the screen where subtitles normally appear.
+            // This avoids picking up most app buttons, headers, and unrelated on-screen text.
+            val cropTop = (image.height * 0.55f).toInt()
+            subtitleBitmap = android.graphics.Bitmap.createBitmap(
+                fullBitmap, 0, cropTop, image.width, image.height - cropTop
+            )
+            val input = InputImage.fromBitmap(subtitleBitmap, 0)
+
+            val korean = try { Tasks.await(koreanRecognizer.process(input)) }
+                catch (e: Exception) {
+                    android.util.Log.w("JapaneseSubtitleOCR", "Korean OCR failed", e)
+                    null
+                }
+            val latin = try { Tasks.await(latinRecognizer.process(input)) }
+                catch (e: Exception) {
+                    android.util.Log.w("JapaneseSubtitleOCR", "Latin OCR failed", e)
+                    null
+                }
+
             val candidates = listOfNotNull(korean, latin)
                 .flatMap { result -> result.textBlocks.mapNotNull { block ->
-                    val box = block.boundingBox ?: return@mapNotNull null
-                    if (box.centerY() < image.height * 0.55f) null
-                    else Triple(block.text.trim(), box, box.bottom)
+                    val localBox = block.boundingBox ?: return@mapNotNull null
+                    val text = block.text.replace(Regex("\\s+"), " ").trim()
+                    if (!isSubtitleCandidate(text, localBox)) return@mapNotNull null
+
+                    // OCR coordinates are relative to the cropped subtitle area.
+                    val box = android.graphics.Rect(localBox).apply { offset(0, cropTop) }
+                    Triple(text, box, box.bottom)
                 } }
-                .filter { it.first.isNotBlank() && it.first.length <= 160 }
                 .distinctBy { it.first }
                 .sortedBy { it.third }
 
-            val candidate = candidates.lastOrNull() ?: return
+            val candidate = candidates.lastOrNull() ?: run {
+                android.util.Log.d("JapaneseSubtitleOCR", "No subtitle-like text found in lower screen area")
+                return
+            }
             val source = candidate.first
-            if (source == lastSource || source.length < 1) return
-            val language = try {
-                Tasks.await(languageIdentifier.identifyLanguage(source))
-            } catch (_: Exception) { "und" }
-            val sourceCode = when (language) {
-                "ko" -> com.google.mlkit.nl.translate.TranslateLanguage.KOREAN
-                "en" -> com.google.mlkit.nl.translate.TranslateLanguage.ENGLISH
+            if (source == lastSource || source == lastTranslated) return
+
+            // Script-based selection is more reliable than language identification for short subtitles.
+            // Only Korean and English are in scope for this prototype.
+            val sourceCode = when {
+                Regex("[\\uAC00-\\uD7A3]").containsMatchIn(source) ->
+                    com.google.mlkit.nl.translate.TranslateLanguage.KOREAN
+                Regex("[A-Za-z]").containsMatchIn(source) ->
+                    com.google.mlkit.nl.translate.TranslateLanguage.ENGLISH
                 else -> return
             }
-            if (source == lastTranslated) return
-            lastSource = source
+
+            android.util.Log.d("JapaneseSubtitleOCR", "Subtitle candidate ($sourceCode): $source")
             val translator = translators.getOrPut(sourceCode) {
                 Translation.getClient(TranslatorOptions.Builder()
                     .setSourceLanguage(sourceCode)
@@ -168,20 +193,46 @@ class CaptureService : Service() {
             val translated = try {
                 Tasks.await(translator.downloadModelIfNeeded())
                 Tasks.await(translator.translate(source))
-            } catch (_: Exception) { "" }
+            } catch (e: Exception) {
+                android.util.Log.w("JapaneseSubtitleOCR", "Translation failed for: $source", e)
+                ""
+            }
+
             if (translated.isNotBlank()) {
+                lastSource = source
                 lastTranslated = source
                 val bounds = candidate.second
                 val overlayWidth = (bounds.width() + 48).coerceIn(image.width / 3, image.width)
                 val centerOffset = bounds.centerX() - image.width / 2
                 showSubtitle(translated, centerOffset, bounds.top.coerceIn(
-                    (image.height * 0.55f).toInt(), image.height - 1
+                    cropTop, image.height - 1
                 ), overlayWidth)
+                android.util.Log.d("JapaneseSubtitleOCR", "Translation displayed: $translated")
             }
         } finally {
-            cropped?.recycle()
+            subtitleBitmap?.recycle()
+            fullBitmap?.recycle()
             padded.recycle()
         }
+    }
+
+    private fun isSubtitleCandidate(text: String, box: android.graphics.Rect): Boolean {
+        if (text.length !in 3..160) return false
+        if (box.height() < 10 || box.width() < 24) return false
+
+        val hangulCount = Regex("[\\uAC00-\\uD7A3]").findAll(text).count()
+        val latinCount = Regex("[A-Za-z]").findAll(text).count()
+        val letterCount = hangulCount + latinCount
+
+        // Reject clocks, counters, and other mostly numeric/symbol UI elements.
+        if (letterCount < 2) return false
+        val usefulRatio = letterCount.toFloat() / text.count { !it.isWhitespace() }.coerceAtLeast(1)
+        if (usefulRatio < 0.35f) return false
+
+        // Ignore text pinned to the extreme left/right edges, which is often UI chrome.
+        val centerRatio = box.centerX().toFloat() / resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        if (centerRatio < 0.08f || centerRatio > 0.92f) return false
+        return hangulCount > 0 || latinCount > 0
     }
 
     private fun showSubtitle(text: String, x: Int = 0, y: Int = -1, width: Int = -1) {
